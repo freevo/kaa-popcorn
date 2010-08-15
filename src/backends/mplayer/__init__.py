@@ -1,12 +1,10 @@
 # -*- coding: iso-8859-1 -*-
-# -----------------------------------------------------------------------------
-# mplayer/__init__.py - mplayer backend
-# -----------------------------------------------------------------------------
 # $Id$
-#
+# -----------------------------------------------------------------------------
+# __init__.py - mplayer backend
 # -----------------------------------------------------------------------------
 # kaa.popcorn - Generic Player API
-# Copyright (C) 2006 Jason Tackaberry, Dirk Meyer
+# Copyright (C) 2008 Jason Tackaberry, Dirk Meyer
 #
 # Please see the file AUTHORS for a complete list of authors.
 #
@@ -23,13 +21,11 @@
 # You should have received a copy of the GNU General Public License along
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
-#
 # -----------------------------------------------------------------------------
 
 __all__ = [ 'import_backend' ]
 
-# kaa.popcorn imports
-from kaa.popcorn.ptypes import *
+from ...common import *
 
 def get_capabilities():
     """
@@ -41,11 +37,11 @@ def get_capabilities():
 
     # player imports
     from config import config
-    from player import _get_mplayer_info
+    from utils import get_mplayer_info
+
 
     capabilities = {
-        CAP_OSD : False,
-        CAP_CANVAS : False,
+        CAP_VIDEO: True,
         CAP_DYNAMIC_FILTERS : False,
         CAP_VARIABLE_SPEED : True,
         CAP_VISUALIZATION : False,
@@ -57,20 +53,15 @@ def get_capabilities():
 
     mp_cmd = config.path
     if not mp_cmd:
-        mp_cmd = kaa.utils.which("mplayer")
-    info = _get_mplayer_info(mp_cmd)
+        mp_cmd = kaa.utils.which('mplayer')
+    info = get_mplayer_info(mp_cmd)
     if not info:
         return None, None, None, None, None
 
-    if "overlay" in info["video_filters"]:
-        capabilities[CAP_OSD] = True
-    if "outbuf" in info["video_filters"]:
-        capabilities[CAP_CANVAS] = True
-
     # TODO: set CAP_VISUALIZATION if we have libvisual
 
-    schemes = [ "file", "vcd", "cdda", "cue", "tivo", "http", "mms",
-                "rtp", "rtsp", "ftp", "udp", "sdp", "dvd", "fifo" ]
+    schemes = [ 'file', 'vcd', 'cdda', 'cue', 'tivo', 'http', 'mms',
+                'rtp', 'rtsp', 'ftp', 'udp', 'sdp', 'dvd', 'fifo' ]
 
     # list of extensions when to prefer this player
     exts = config.preferred.extensions.split(',')
@@ -89,4 +80,4 @@ def import_backend():
     Return player name, class and capability function.
     """
     from player import MPlayer
-    return ("mplayer", MPlayer, get_capabilities)
+    return ('mplayer', MPlayer, get_capabilities)

@@ -1,12 +1,10 @@
 # -*- coding: iso-8859-1 -*-
-# -----------------------------------------------------------------------------
-# __init__.py - Generic Player Interface
-# -----------------------------------------------------------------------------
 # $Id$
-#
+# -----------------------------------------------------------------------------
+# __init__.py - 
 # -----------------------------------------------------------------------------
 # kaa.popcorn - Generic Player API
-# Copyright (C) 2006 Jason Tackaberry, Dirk Meyer
+# Copyright (C) 2008 Jason Tackaberry, Dirk Meyer
 #
 # Please see the file AUTHORS for a complete list of authors.
 #
@@ -23,11 +21,9 @@
 # You should have received a copy of the GNU General Public License along
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
-#
 # -----------------------------------------------------------------------------
 
 from version import VERSION
-from generic import Player
-from ptypes import *
+from proxy import Player
+from common import *
 from config import config
-from backends.manager import get_all_players as player_names

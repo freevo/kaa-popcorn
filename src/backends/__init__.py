@@ -1,12 +1,10 @@
 # -*- coding: iso-8859-1 -*-
-# -----------------------------------------------------------------------------
-# backends - Load and init the player backends
-# -----------------------------------------------------------------------------
 # $Id$
-#
+# -----------------------------------------------------------------------------
+# __init__.py - Load configuration for available backends.
 # -----------------------------------------------------------------------------
 # kaa.popcorn - Generic Player API
-# Copyright (C) 2006 Jason Tackaberry, Dirk Meyer
+# Copyright (C) 2008 Jason Tackaberry, Dirk Meyer
 #
 # Please see the file AUTHORS for a complete list of authors.
 #
@@ -23,21 +21,24 @@
 # You should have received a copy of the GNU General Public License along
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
-#
 # -----------------------------------------------------------------------------
 
-# python imports
+__all__ = ['config']
+
 import os
 import sys
 
 config = []
 
-for backend in os.listdir(os.path.dirname(__file__)):
-    dirname = os.path.join(os.path.dirname(__file__), backend)
-    if os.path.isdir(dirname):
-        try:
-            # import the backend config
-            exec('from %s.config import config as c' % backend)
-            config.append((backend, c))
-        except ImportError:
-            continue
+backends_dir = os.path.dirname(__file__)
+for backend in os.listdir(backends_dir):
+    dirname = os.path.join(backends_dir, backend)
+    if not os.path.isdir(dirname):
+        continue
+
+    try:
+        # import the backend config
+        exec('from %s.config import config as c' % backend)
+        config.append((backend, c))
+    except ImportError:
+        continue

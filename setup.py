@@ -1,12 +1,10 @@
 # -*- coding: iso-8859-1 -*-
+# $Id$
 # -----------------------------------------------------------------------------
 # setup.py - Setup script for kaa.popcorn
 # -----------------------------------------------------------------------------
-# $Id$
-#
-# -----------------------------------------------------------------------------
 # kaa.popcorn - Generic Player API
-# Copyright (C) 2006 Jason Tackaberry, Dirk Meyer
+# Copyright (C) 2008 Jason Tackaberry, Dirk Meyer
 #
 # Please see the file AUTHORS for a complete list of authors.
 #
@@ -23,7 +21,6 @@
 # You should have received a copy of the GNU General Public License along
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
-#
 # -----------------------------------------------------------------------------
 
 # python imports
@@ -42,23 +39,20 @@ except ImportError:
     sys.exit(1)
     
 ext_modules = []
-libvisual = Extension("kaa.popcorn._libvisual", ['src/extensions/libvisual.c'])
-if libvisual.check_library("libvisual", "0.2.0"):
-    print "+ libvisual support enabled"
-    ext_modules.append(libvisual)
-else:
-    print "- libvisual support disabled"
+#libvisual = Extension("kaa.popcorn._libvisual", ['src/extensions/libvisual.c'])
+#if libvisual.check_library("libvisual", "0.2.0"):
+#    print "+ libvisual support enabled"
+#    ext_modules.append(libvisual)
+#else:
+#    print "- libvisual support disabled"
 
-setup(
-    module = 'popcorn', 
-    version = '0.1.0', 
-    scripts = ['bin/popcorn'],
-    license = 'GPL',
-    summary = 'Media player abstraction library supporting multiple backends',
-    rpminfo = {
-        'requires': 'python-kaa-base >= 0.1.2, python-kaa-xine >= 0.9.0',
-        'build_requires': 'python-kaa-base >= 0.1.2'
-    },
-    ext_modules = ext_modules,
-    namespace_packages = ['kaa']
-)
+setup(module = 'popcorn', 
+      version = '0.2.0', 
+#      scripts = [ 'bin/popcorn' ],
+      license = 'GPL',
+      summary = 'Media player abstraction library supporting multiple backends',
+      rpminfo = {
+          'requires':       'python-kaa-base >= 0.1.2, python-kaa-xine >= 0.9.0',
+          'build_requires': 'python-kaa-base >= 0.1.2'
+      },
+      ext_modules = ext_modules)

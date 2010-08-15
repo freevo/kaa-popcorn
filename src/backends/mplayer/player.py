@@ -1,12 +1,10 @@
 # -*- coding: iso-8859-1 -*-
-# -----------------------------------------------------------------------------
-# mplayer/player.py - mplayer backend
-# -----------------------------------------------------------------------------
 # $Id$
-#
+# -----------------------------------------------------------------------------
+# player.py - mplayer backend
 # -----------------------------------------------------------------------------
 # kaa.popcorn - Generic Player API
-# Copyright (C) 2006 Jason Tackaberry, Dirk Meyer
+# Copyright (C) 2008 Jason Tackaberry, Dirk Meyer
 #
 # Please see the file AUTHORS for a complete list of authors.
 #
@@ -23,778 +21,587 @@
 # You should have received a copy of the GNU General Public License along
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
-#
 # -----------------------------------------------------------------------------
+
+__all__ = [ 'MPlayer' ]
 
 # python imports
 import logging
-import os
 import re
-import string
+import os
 import stat
-import threading
-import struct
+import string
 
 # kaa imports
 import kaa
-from kaa import shm
 import kaa.utils
+from kaa.utils import property
 import kaa.display
 
-# kaa.popcorn base imports
-from kaa.popcorn.backends.base import MediaPlayer, runtime_policy, \
-     APPLY_ALWAYS, IGNORE_UNLESS_PLAYING, DEFER_UNTIL_PLAYING
-from kaa.popcorn.ptypes import *
-from kaa.popcorn.config import config
-
-# special mplayer ipc handling
-from ipc import ChildProcess
-
-BUFFER_UNLOCKED = 0x10
-BUFFER_LOCKED = 0x20
+# kaa.popcorn imports
+from ...common import *
+from utils import *
 
 # get logging object
 log = logging.getLogger('popcorn.mplayer')
-childlog = logging.getLogger('popcorn.child').debug
 
-# A cache holding values specific to an MPlayer executable (version,
-# filter list, video/audio driver list, input keylist).  This dict is
-# keyed on the full path of the MPlayer binary.
-_cache = {}
+# Global constants
+# regexp whose groups() is (vpos, apos, speed)
+RE_STATUS = re.compile(r'(?:V:\s*([\d.]+)|A:\s*([\d.]+)\s\W)(?:.*\s([\d.]+x))?')
+RE_ERROR = re.compile(r'^(File not found|Failed to open|MPlayer interrupt|Unknown option|Error parsing|FATAL:)')
 
-def _get_mplayer_info(path, callback = None, mtime = None):
-    """
-    Fetches info about the given MPlayer executable.  If the values are
-    cached and the cache is fresh, it returns a dict immediately.  If it
-    needs to load MPlayer to fetch the values and callback is specified,
-    it does so in a thread, and calls callback with the results on
-    completion.  If callback is None and no information is in the cache,
-    this function blocks.
-
-    If 'mtime' is not None, it means we've called ourself as a thread.
-    """
-
-    if not mtime:
-        # Fetch the mtime of the binary
-        try:
-            mtime = os.stat(path)[stat.ST_MTIME]
-        except (OSError, TypeError):
-            return None
-
-        if path in _cache and _cache[path]["mtime"] == mtime:
-            # Cache isn't stale, so return that.
-            return _cache[path]
-
-        if callback:
-            # We need to run MPlayer to get these values.  Create a signal,
-            # call ourself as a thread, and return the signal back to the
-            # caller.
-            async = kaa.ThreadCallable(_get_mplayer_info, path, None, mtime)()
-            # ThreadCallable class ensures the callbacks get invoked in the main
-            # thread.
-            async.connect_both(callback, callback)
-            return None
-
-    # At this point we're running in a thread.
-    info = {
-        "version": None,
-        "mtime": mtime,
-        "video_filters": {},
-        "video_drivers": {},
-        "audio_filters": {},
-        "audio_drivers": {},
-        "keylist": []
-    }
-
-    groups = {
-        'video_filters': ('Available video filters', r'\s*(\w+)\s+:\s+(.*)'),
-        'video_drivers': ('Available video output', r'\s*(\w+)\s+(.*)'),
-        'audio_filters': ('Available audio filters', r'\s*(\w+)\s+:\s+(.*)'),
-        'audio_drivers': ('Available audio output', r'\s*(\w+)\s+(.*)')
-    }
-    curgroup = None
-    for line in os.popen('%s -vf help -af help -vo help -ao help' % path):
-        # Check version
-        if line.startswith("MPlayer "):
-            info['version'] = line.split()[1]
-        # Find current group.
-        for group, (header, regexp) in groups.items():
-            if line.startswith(header):
-                curgroup = group
-                break
-        if not curgroup:
-            continue
-
-        # Check regexp
-        m = re.match(groups[curgroup][1], line.strip())
-        if not m:
-            continue
-
-        if len(m.groups()) == 2:
-            info[curgroup][m.group(1)] = m.group(2)
-        else:
-            info[curgroup].append(m.group(1))
-
-    # Another pass for key list.
-    for line in os.popen('%s -input keylist' % path):
-        # Check regexp
-        m = re.match(r'^(\w+)$', line.strip())
-        if not m:
-            continue
-        info['keylist'].append(m.group(1))
+STREAM_INFO_MAP = { 
+    'VIDEO_FORMAT': ('vfourcc', str),
+    'VIDEO_CODEC': ('vcodec', str),
+    'VIDEO_BITRATE': ('vbitrate', int),
+    'VIDEO_WIDTH': ('width', int),
+    'VIDEO_HEIGHT': ('height', int),
+    'VIDEO_FPS': ('fps', float),
+    'VIDEO_ASPECT': ('aspect', float),
+    'AUDIO_FORMAT': ('afourcc', str),
+    'AUDIO_CODEC': ('acodec', str),
+    'AUDIO_BITRATE': ('abitrate', int),
+    'AUDIO_NCH': ('channels', int),
+    'LENGTH': ('length', float),
+    'FILENAME': ('uri', str),
+    'SEEKABLE': ('seekable', bool),
+}
 
 
-    _cache[path] = info
-    return info
+class MPlayer(object):
 
+    def __init__(self, proxy):
+        #self._proxy = kaa.weakref.weakref(proxy)
+        self._proxy = proxy
+        self._state = STATE_NOT_RUNNING
+        # Internal error signal.  Not all errors emitted to this signal are
+        # meant to be visible to the proxy.
+        self._error_signal = kaa.Signal()
+        self._error_message = None
 
-class MPlayer(MediaPlayer):
+        # A kaa.Process object if mplayer is running.
+        self._child = None
+        self._mp_cmd = proxy._config.mplayer.path
+        self._reset_stream()
 
-    RE_STATUS = re.compile("V:\s*([\d+\.]+)|A:\s*([\d+\.]+)\s\W")
-    RE_SWS = re.compile("^SwScaler: [0-9]+x[0-9]+ -> ([0-9]+)x([0-9]+)")
-
-    def __init__(self, properties):
-        super(MPlayer, self).__init__(properties)
-        self.state = STATE_NOT_RUNNING
-        self._mp_cmd = config.mplayer.path
-        if not self._mp_cmd:
-            self._mp_cmd = kaa.utils.which("mplayer")
-
-        if not self._mp_cmd:
-            raise PlayerError, "No MPlayer executable found in PATH"
-
-        self._mplayer = None
-
+        # TODO: use these.
         self._filters_pre = []
         self._filters_add = []
 
-        self._mp_info = _get_mplayer_info(self._mp_cmd, self._handle_mp_info)
-        self._check_new_frame_t = kaa.WeakTimer(self._check_new_frame)
-        self._cur_outbuf_mode = [True, False, None] # vo, shmem, size
+        if not self._mp_cmd:
+            self._mp_cmd = kaa.utils.which('mplayer')
+            if not self._mp_cmd:
+                raise PlayerError('No mplayer executable found in PATH')
+
+        # Fetch info for this mplayer.  It's almost guaranteed that this
+        # will returned a cached value, so it won't block.
+        self._mp_info = get_mplayer_info(self._mp_cmd)
+        if not self._mp_info:
+            # It is extremely unlikely this will happen, because the backend manager
+            # will alraedy have called get_mplayer_info and the proxy would not
+            # have received us as a suitable player class if it failed.
+            raise PlayerError("MPlayer at %s (found in PATH) isn't behaving as expected" % self._mp_cmd)
 
 
-    def __del__(self):
-        if self._frame_shmem:
-            self._frame_shmem.detach()
-        if self._osd_shmem:
-            self._osd_shmem.detach()
+    #########################################
+    # Properties
 
+    @property
+    def state(self):
+        # The state property is not accessible from the outside, so we don't
+        # need to worry about anyone messing with our state.
+        return self._state
 
-    def _handle_mp_info(self, info, exception=None, traceback=None):
-        if exception is not None:
-            self.state = STATE_NOT_RUNNING
-            # TODO: handle me
-            raise info
-        self._mp_info = info
+    @state.setter
+    def state(self, value):
+        if self._state != value:
+            log.info('State change: %s -> %s', self._state, value)
+            if value == STATE_NOT_RUNNING:
+                # MPlayer destroys the window on exit so it's no longer valid.  Set
+                # it to none now so the proxy doesn't try to do anything with it,
+                # and so that we recreate it on the next play().
+                self._proxy._window_inner = None
+                if isinstance(self._proxy.window, kaa.display.X11Window):
+                    # Hide the window.  Again, should we do this automatically or 
+                    # use a property?  XXX: note if we don't do it automatically,
+                    # we will need to explicitly call proxy._window_layot() after
+                    # playing because there will be no resize event to do that
+                    # for us otherwise.
+                    self._proxy.window.hide()
 
+            self._state = value
+                
 
+    @property
+    def position(self):
+        return self._position
 
-    #
-    # child IO
-    #
+    @property
+    def width(self):
+        return self._stream_info.get('width')
 
-    def _child_handle_line(self, line):
-        if re.search("@@@|outbuf|overlay", line, re.I):
-            childlog(line)
-        elif line[:2] not in ("A:", "V:"):
-            childlog(line)
+    @property
+    def height(self):
+        return self._stream_info.get('height')
 
-        if line.startswith("V:") or line.startswith("A:"):
-            m = MPlayer.RE_STATUS.search(line)
-            if m:
-                old_pos = self.position
-                p = (m.group(1) or m.group(2)).replace(",", ".")
-                self.position = float(p)
-                # if self.position - old_pos < 0 or \
-                # self.position - old_pos > 1:
-                # self.signals["seek"].emit(self.position)
+    @property
+    def aspect(self):
+        return self._stream_info.get('aspect')
 
-                # XXX this logic won't work with seek-while-paused patch; state
-                # will be "playing" after a seek.
-                if self.state == STATE_PAUSED:
-                    self.state = STATE_PLAYING
-                if self.state == STATE_OPEN:
-                    self.set_frame_output_mode()
-                    self._mplayer.sub_visibility(False)
-                    self.state = STATE_PLAYING
-                    self.signals["stream_changed"].emit()
+    @property
+    def vfourcc(self):
+        return self._stream_info.get('vfourcc')
 
-        elif line.startswith("  =====  PAUSE"):
-            self.state = STATE_PAUSED
+    @property
+    def afourcc(self):
+        return self._stream_info.get('afourcc')
 
-        elif line.startswith("ID_") and line.find("=") != -1:
-            attr, value = line.split('=', 1)
-            attr = attr[3:]
-            info = { "VIDEO_FORMAT": ("vfourcc", str),
-                     "VIDEO_BITRATE": ("vbitrate", int),
-                     "VIDEO_WIDTH": ("width", int),
-                     "VIDEO_HEIGHT": ("height", int),
-                     "VIDEO_FPS": ("fps", float),
-                     "VIDEO_ASPECT": ("aspect", float),
-                     "AUDIO_FORMAT": ("afourcc", str),
-                     "AUDIO_CODEC": ("acodec", str),
-                     "AUDIO_BITRATE": ("abitrate", int),
-                     "AUDIO_NCH": ("channels", int),
-                     "LENGTH": ("length", float),
-                     "FILENAME": ("filename", str) }
-            if attr in info:
-                self.streaminfo[info[attr][0]] = info[attr][1](value)
+    @property
+    def length(self):
+        return self._stream_info.get('length')
 
-        elif line.startswith("Movie-Aspect"):
-            aspect = line[16:].split(":")[0].replace(",", ".")
-            if aspect[0].isdigit():
-                self.streaminfo["aspect"] = float(aspect)
+    @property
+    def uri(self):
+        return self._stream_info.get('uri')
 
-        elif line.startswith("VO:"):
-            m = re.search("=> (\d+)x(\d+)", line)
-            if m:
-                vo_w, vo_h = int(m.group(1)), int(m.group(2))
-                if "aspect" not in self.streaminfo or \
-                       self.streaminfo["aspect"] == 0:
-                    # No aspect defined, so base it on vo size.
-                    self.streaminfo["aspect"] = vo_w / float(vo_h)
+    @property
+    def seekable(self):
+        if self._stream_info.get('seekable'):
+            # MPlayer's ID_SEEKABLE is not reliable, so if kaa.metadata says
+            # the file is corrupt, treat that as authoritative.
+            if (not hasattr(self._media, 'corrupt') or not self._media.corrupt):
+                return True
+        return False
 
-        elif line.startswith("overlay:") and line.find("reusing") == -1:
-            m = re.search("(\d+)x(\d+)", line)
-            if m:
-                width, height = int(m.group(1)), int(m.group(2))
-                try:
-                    if self._osd_shmem:
-                        self._osd_shmem.detach()
-                except shm.error:
-                    pass
-                self._osd_shmem = shm.memory(\
-                    shm.getshmid(self._osd_shmkey))
-                self._osd_shmem.attach()
+    @property
+    def audio_delay(self):
+        return -self._stream_info.get('audio_delay', 0.0)
 
-                self.signals["osd_configure"].emit(\
-                    width, height, self._osd_shmem.addr + 16, width, height)
+    @audio_delay.setter
+    def audio_delay(self, value):
+        self._stream_info['audio_delay'] = -float(value)
+        if self._child:
+            self._slave_cmd('audio_delay %f 1' % -float(value))
 
-        elif line.startswith("outbuf:") and line.find("shmem key") != -1:
-            try:
-                if self._frame_shmem:
-                    self._frame_shmem.detach()
-            except shm.error:
-                pass
-            self._frame_shmem = shm.memory(shm.getshmid(self._frame_shmkey))
-            self._frame_shmem.attach()
-            self.set_frame_output_mode()  # Sync
+    @property
+    def cache(self):
+        return self._stream_info.get('cache', 'auto')
 
-        elif line.startswith("EOF code"):
-            if self.state in (STATE_PLAYING, STATE_PAUSED):
-                # The player may be idle bow, but we can't set the
-                # state. If we do, generic will start a new file while
-                # the mplayer process is still running and that does
-                # not work. Unless we reuse mplayer proccesses we
-                # don't react on EOF and only handle the dead
-                # proccess.
-                # self.state = STATE_IDLE
-                pass
+    @cache.setter
+    def cache(self, value):
+        # Cache is not settable while MPlayer is running.
+        self._stream_info['cache'] = value
 
-        elif line.startswith("FATAL:"):
-            log.error(line.strip())
+    @property
+    def deinterlace(self):
+        return self._stream_info.get('deinterlace', False)
 
+    @deinterlace.setter
+    def deinterlace(self, value):
+        self._stream_info['deinterlace'] = bool(value)
+        if self._child:
+            self._slave_cmd('set_property deinterlace %d' % int(value))
+        
 
-    def _child_exited(self, exitcode):
-        log.info('mplayer exited')
+    #########################################
+    # Private Methods
+
+    def _handle_child_exit(self, code):
+        self._child = None
+        if self.state in (STATE_STARTING, STATE_PLAYING, STATE_PAUSED):
+            # Child died when we didn't expect it to.  Adjust state now and
+            # emit appropriate signals.
+            cause = self._error_message if self._error_message else 'Unknown failure caused abort'
+            log.error('MPlayer child aborted abnormally, state=%s: %s', self.state, cause)
+            exc = PlayerError(cause)
+            self._proxy._emit_finished(exc)
+            self._proxy.signals['error'].emit(exc, self.state, STATE_NOT_RUNNING)
+        else:
+            log.info('MPlayer child exited: state=%s', self.state)
         self.state = STATE_NOT_RUNNING
 
 
-    def _is_alive(self):
-        return self._mplayer and self._mplayer.running
+    def _spawn(self, args, interactive=False):
+        self._child = kaa.Process(self._mp_cmd)
+        self._child.delimiter = ['\r', '\n']
+        if interactive:
+            self._child.stop_command = 'quit\nquit\n'
+
+        self._child.signals['finished'].connect_weak(self._handle_child_exit)
+        self._child.signals['readline'].connect_weak(self._handle_child_line)
+        return self._child.start([ str(x) for x in args ])
+
+    def _slave_cmd(self, cmd, *args):
+        output = 'pausing_keep %s %s' % (cmd, ' '.join([ str(x) for x in args]))
+        log.info('Slave cmd: %s', output)
+        self._child.write(output.strip() + '\n')
 
 
+    def _handle_child_line(self, line):
+        #log.debug(line)
+        if line.startswith('V:') or line.startswith('A:'):
+            m = RE_STATUS.search(line)
+            if not m:
+                log.error('Could not parse status line: %s', line)
+                return
 
-    #
-    # Methods for MediaPlayer subclasses
-    #
+            old = self._position
+            self._position = float((m.group(1) or m.group(2)).replace(',', '.'))
+            
+            if self._stream_changed and self.state != STATE_STARTING:
+                # Stream changed so emit.  We don't bother emitting if the
+                # stream state is STATE_STARTING since we handle that later.
+                self._stream_changed = False
+                self._proxy.signals['stream-changed'].emit()
 
+            if self._waiting_for_seek and (self._position < old or self._position - old > 1):
+                log.info('MPlayer seeked to %f', self._position)
+                self._proxy.signals['seek'].emit(old, self._position)
+            elif self.state == STATE_PAUSED:
+                self.state = STATE_PLAYING
+                self._proxy.signals['play'].emit()
+            elif self.state == STATE_STARTING:
+                # We start the file with deinterlacing enabled.  Need to decide
+                # now whether to disable it or leave it enabled.  We also set
+                # the stream deinterlaced property to the actual True/False value
+                # in case it was set to 'auto'
+                si_deint = self._stream_info['deinterlace']
+                if not si_deint or (si_deint == 'auto' and not getattr(self._media, 'interlaced', False)):
+                    # User set deinterlacing to False (from auto) or it's auto but
+                    # kaa.metadata says the video is not interlaced, so we disable.
+                    self._slave_cmd('set_property deinterlace 0')
+                    self._stream_info['deinterlace'] = False
+                else:
+                    # We've left deinterlacing enabled.
+                    self._stream_info['deinterlace'] = True
+
+                self.state = STATE_PLAYING
+                self._stream_changed = False
+                self._proxy.signals['stream-changed'].emit()
+                self._proxy.signals['start'].emit()
+                self._proxy.signals['play'].emit()
+
+            self._proxy.signals['position-changed'].emit(old, self._position)
+
+
+        elif line.startswith('ID_PAUSED'):
+            self.state = STATE_PAUSED
+            self._proxy.signals['pause'].emit()
+
+        elif line.startswith('ID_') and '=' in line:
+            attr, value = line.rstrip().split('=', 1)
+            attr, tp = STREAM_INFO_MAP.get(attr[3:], (None, None))
+            if attr:
+                self._stream_info[attr] = tp(value)
+                self._stream_changed = True
+
+        elif line.startswith('EOF code'):
+            self.state = STATE_NOT_RUNNING
+            self._proxy._emit_finished(None)
+
+        elif re.match(RE_ERROR, line):
+            self._error_message = line
+            self._error_signal.emit(PlayerError(line))
+
+
+    def _reset_stream(self):
+        """
+        Resets stream parameters.
+        """
+        # Stream info as fetched by -identify as well as some custom attrs.
+        # We initialize it with global defaults from the proxy.
+        self._stream_info = {
+            'audio_delay': self._proxy._config.audio.delay,
+            'deinterlace': {'yes': True, 'no': False}.get(self._proxy._config.video.deinterlacing.enabled, 'auto'),
+            'cache': self._proxy._config.cache
+        }
+        # Position in seconds in stream (float)
+        self._position = 0.0
+        # Start seek position, set when seek() is called in STATE_OPEN
+        self._ss_seek = None
+        # Counter indicating the number of seeks we have issued but have not
+        # yet seen the stream position change.
+        self._waiting_for_seek = 0
+        # True if stream properties have changed.  We want to emit
+        # stream-changed on the next status line.
+        self._stream_changed = False
+        self._error_message = None
+
+
+    @kaa.coroutine()
+    def _handle_fatal_error(self, msg):
+        # Store current state in case we call self.stop() which will
+        # modify state.  We want to pass the current state when we emit
+        # the error signal.
+        orig_state = self.state
+
+        # Stop MPlayer process.  In normal cases (that is, where MPlayer
+        # isn't hung on the file), the child process is probably exited by
+        # now, we just haven't reaped it. Before raising the open failure
+        # exception, we'll wait for the child to die.  In the worst case,
+        # where MPlayer is stuck and kill -15 doesn't dispense with it,
+        # this should take not longer than 6 seconds.
+        yield self.stop()
+
+        # At this point child is dead and state is STATE_NOT_RUNNING (from
+        # stop()).  Construct exception and emit catch-all error signal.
+        exc = PlayerError(msg)
+        self._proxy.signals['error'].emit(exc, orig_state, STATE_NOT_RUNNING)
+        raise exc
+
+
+    @kaa.coroutine()
+    def _wait_for_signals(self, *signals, **opts):
+        signals = self._proxy.signals.subset(*signals).values()
+        ip = kaa.InProgressAny(self._child, self._error_signal, *signals)
+        # If proxy calls abort() on IP yielded by the open() coroutine, then
+        # this IPAny we're about to yield will get aborted too, just before
+        # this coroutine is aborted.  Make the IPAny abortable.
+        ip.abortable = True
+        n, args = yield ip
+
+        if n == 1 or (n == 0 and args != 0):
+            # Either error signal was emitted or MPlayer returned non-zero.
+            cause = args.message if n else '%s failed for unknown reason (%s)' % (opts['task'], args)
+            yield self._handle_fatal_error(cause)
+        yield n-2
+
+
+    #########################################
+    # Public Methods
+
+    @precondition(states=STATE_NOT_RUNNING)
+    @kaa.coroutine()
     def open(self, media):
         """
-        Open media.
-        """
-        if self.state != STATE_NOT_RUNNING:
-            raise RuntimeError('mplayer not in STATE_NOT_RUNNING')
+        Opens an MRL.
 
-        args = []
-        if media.scheme == "dvd":
-            file, title = re.search("(.*?)(\/\d+)?$", media.url[4:]).groups()
+        :param media: the object representing the file to load.
+        :type media: :class:`kaa.metadata.Media`
+        :returns: :class:`~kaa.InProgress`
+        
+        Required state is STATE_NOT_RUNNING, which we expect the proxy to
+        enforce.  State is immediately changed to STATE_OPENING.  The returned
+        InProgress is finished and state set to STATE_OPEN upon successful open
+        of the mrl.  The open may be aborted (when in STATE_OPENING) by calling
+        stop().
+        """
+
+        log.debug('mplayer backend: opening %s', media.url)
+
+        args = ArgumentList()
+        if media.scheme == 'dvd':
+            file, title = re.search('(.*?)(\/\d+)?$', media.url[4:]).groups()
             if file.replace('/', ''):
-                if not os.path.isfile(file):
-                    raise ValueError, "Invalid ISO file: %s" % file
-                args.extend(('-dvd-device', file))
-            args.append("dvd://")
-            if title:
-                args[-1] += title[1:]
+                if not os.path.exists(file):
+                    raise ValueError('Invalid ISO file: %s' % file)
+                args.add(dvd_device=os.path.normpath(file))
+            args.append('dvd://%s' % (title[1:] if title else ''))
         else:
             args.append(media.url)
 
+        # Universal mplayer args
+        args.extend('-nolirc -nojoystick -identify')
+        media._mplayer_args = args[:]
         self._media = media
-        self._media.mplayer_args = args
+        self._reset_stream()
         self.state = STATE_OPENING
 
-        # We have a problem at this point. The 'open' function is used to
-        # open the stream and provide information about it. After that, the
-        # caller can still change stuff before calling play. Mplayer doesn't
-        # work that way so we have to run mplayer with -identify first.
-        args = "-nolirc -nojoystick -identify -vo null -ao null -frames 0 -nocache"
-        ident = kaa.Process(self._mp_cmd)
-        ident.delimiter = ['\n', '\r']
-        signal = ident.start(args.split(' ') + self._media.mplayer_args)
-        signal.connect_weak(self._ident_exited)
-        ident.signals['readline'].connect_weak(self._child_handle_line)
+        # The 'open' function is used to open the stream and provide
+        # information about it. After that, the caller can still change stuff
+        # before calling play. MPlayer doesn't work that way so we have to run
+        # mplayer with -identify first.
+        args.extend('-vo null -ao null -frames 0 -nocache -demuxer lavf')
+        self._spawn(args)
 
+        yield self._wait_for_signals(task='Open')
 
-    def _ident_exited(self, code):
-        """
-        mplayer -identify finished
-        """
+        # If we're here, identify was successful, so we're open for business.
         self.state = STATE_OPEN
+        self._proxy.signals['open'].emit()
 
 
-    def configure_video(self):
-        """
-        Configure arguments and filter for video.
-        """
-        # get argument and filter list
-        args, filters = self._mplayer.args, self._mplayer.filters
-
-        # create filter list
-        filters.extend(self._filters_pre[:])
-        # FIXME: all this code seems to work. But I guess it has
-        # some problems when we don't have an 1:1 pixel aspect
-        # ratio on the monitor and using software scaler.
-
-        aspect, dsize = self.aspect
-        if hasattr(self._window, 'get_size'):
-            size = self._window.get_size()
-        else:
-            # kaa.candy widget
-            size = self._window.width, self._window.height
-        # This may be needed for some non X based displays
-        args.add(screenw=size[0], screenh=size[1])
-
-        if not self._properties['scale'] == SCALE_IGNORE:
-            # Expand to fit the given aspect. In scaled mode we don't
-            # do that which will result in a scaled image filling
-            # the whole screen
-            filters.append('expand=:::::%s/%s' % tuple(aspect))
-            # The expand filter has some strange side-effect on 4:3 content
-            # on a 16:9 screen. With software scaling instead of black bars
-            # on both sides you see garbage, without sws and xv output mplayer
-            # uses gray bars. The following line removed that.
-            args.append('-noslices')
-            
-        # FIXME: this only works if the window has the the aspect
-        # as the full screen. In all other cases the window is not
-        # fully used but at least with black bars.
-        if self._properties['scale'] == SCALE_ZOOM:
-            # This DOES NOT WORK as it should. The hardware scaler
-            # will ignore the settings and keep aspect and does
-            # not crop as default.  When using vo x11 and software
-            # scaling, this lines do what they are supposed to do.
-            filters.append('dsize=%s:%s:1' % size)
-        else:
-            # scale to window size
-            # FIXME: add SCALE_4_3 and SCALE_16_9
-            filters.append('dsize=%s:%s:0' % size)
-
-        # add software scaler based on dsize arguments
-        if self._properties.get('software-scaler') or \
-               config.video.driver in ('x11',):
-            filters.append('scale=0:0')
-            args.add(sws=2)
-
-        # add postprocessing
-        if self._properties.get('postprocessing'):
-            filters.append('pp')
-            args.add(autoq=100)
-
-        try:
-            cpus = kaa.utils.get_num_cpus()
-            args.add(lavdopts='fast:skiploopfilter=nonref:threads=%d' % cpus)
-        except RuntimeError:
-            pass
-
-        # set monitor aspect (needed sometimes, not sure when and why)
-        args.add(monitoraspect='%s:%s' % tuple(aspect))
-
-        filters += self._filters_add
-        #if 'overlay' in self._mp_info['video_filters']:
-        #    filters.append("overlay=%s" % self._osd_shmkey)
-
-        if isinstance(self._window, kaa.display.X11Window):
-            if config.mplayer.embedded:
-                args.add(wid="0x%x" % self._window.get_id())
-            else:
-                args.append('-fs')
-            display = self._window.get_display().get_string()
-            args.add(vo=config.video.driver, display=display,
-                     colorkey=config.video.colorkey)
-        elif self._window:
-            args.append('-fs')
-            args.add(vo=config.video.driver, colorkey=config.video.colorkey)
-        else:
-            args.add(vo='null')
-
-
-    def configure_audio(self):
-        """
-        Configure arguments and filter for video.
-        """
-        # get argument and filter list
-        args, filters = self._mplayer.args, self._mplayer.filters
-
-        if config.audio.passthrough:
-            args.add(ac='hwac3,hwdts,%s' % config.mplayer.audiocodecs)
-        else:
-            if config.mplayer.audiocodecs:
-                args.add(ac='%s' % config.mplayer.audiocodecs)
-            args.add(channels=config.audio.channels)
-
-        args.add(ao=config.audio.driver)
-
-        if config.audio.driver == 'alsa':
-            args[-1] += ":noblock"
-            n_channels = self.streaminfo.get('channels')
-            if self.streaminfo.get('acodec') in ('a52', 'hwac3', 'ffdts', 'hwdts'):
-                device = config.audio.device.passthrough
-            elif n_channels == 1:
-                device = config.audio.device.mono
-            elif n_channels <= 4:
-                device = config.audio.device.surround40
-            elif n_channels <= 6:
-                device = config.audio.device.surround51
-            else:
-                device = config.audio.device.stereo
-            if device != '':
-                args[-1] += ':device=' + device.replace(':', '=')
-
-        # set property audio filename
-        if self._properties.get('audio-filename'):
-            args.add(audiofile=self._properties.get('audio-filename'))
-
-        # set property audio track
-        if self._properties.get('audio-track') is not None:
-            args.add(aid=self._properties.get('audio-track'))
-
-
+    @precondition(states=STATE_OPEN)
+    @kaa.coroutine()
     def play(self):
-        """
-        Start playback.
-        """
-        log.debug('mplayer start playback')
+        config = self._proxy._config
+        vf = []
+        args = self._media._mplayer_args[:]
+        args.extend('-slave -v -osdlevel 0 -fixed-vo -demuxer lavf')
 
-        # we know that self._mp_info has to be there or the object would
-        # not be selected by the generic one. FIXME: verify that!
-        assert(self._mp_info)
-
-        # create mplayer object
-        self._mplayer = ChildProcess(self._mp_cmd, gdb = log.getEffectiveLevel() == logging.DEBUG)
-
-        # get argument and filter list
-        args, filters = self._mplayer.args, self._mplayer.filters
-
-        if 'x11' in self._mp_info['video_drivers']:
-            args.append('-nomouseinput')
-
-        #if 'outbuf' in self._mp_info['video_filters']:
-        #    filters.append("outbuf=%s:yv12" % self._frame_shmkey)
-
-        if self._properties['deinterlace'] == True or \
-               (self._properties['deinterlace'] == 'auto' and \
-                self._media.get('interlaced')):
-            # add deinterlacer
-            filters.append(config.mplayer.deinterlacer)
-
+        if self.audio_delay:
+            args.add(delay=self.audio_delay)
+        if self.cache == 0:
+            args.add(nocache=True)
+        elif isinstance(self.cache, (long, float, int)) or self.cache.isdigit():
+            args.add(cache=self.cache)
+        if self._ss_seek:
+            args.add(ss=self._ss_seek)
+            self._ss_seek = None
 
         if self._media.get('corrupt'):
-            # File marked as corrupt. This happens for avi and mkv files
-            # with no index. To make seeking work, add -idx
+            # Index for the given file is corrupt.  Must add -idx to allow
+            # seeking.  FIXME: for large filesthis can take a while.  We
+            # should: 1. provide progress feedback, 2. use -saveidx to keep
+            # the index for next time.
             args.append('-idx')
-            
-        # FIXME: self._filters_pre / add doesn't get included if no window.
-        if self._window:
-            self.configure_video()
-        else:
-            args.add(vo='null')
 
-        self.configure_audio()
+        window = self._proxy.window
+        if window is None:
+            args.add(vo='null')
+        elif config.video.vdpau.enabled and 'vdpau' in self._mp_info['video_drivers']:
+            deint = {'cheap': 1, 'good': 2, 'better': 3, 'best': 4}.get(config.video.deinterlacing.method, 3)
+            args.add(vo='vdpau:deint=%d,xv,x11' % deint)
+
+            # Decide which codecs to enable based on what the user specified.  We do
+            # a simple substring match.
+            regexp = '|'.join('.*%s.*vdpau' % c for c in config.video.vdpau.formats.replace(' ', '').split(','))
+            args.add(vc=','.join(codec for codec in self._mp_info['video_codecs'] if re.search(regexp, codec)) + ',')
+
+            # If the display rate is less than the frame rate, -framedrop is
+            # needed or else the audio will continually drift.
+            # TODO: we could decide to add this only if the above condition is 
+            args.append('-framedrop')
+        else:
+            args.add(vo='xv,x11')
+            vf.append(getattr(config.mplayer.deinterlacer, config.video.deinterlacing.method))
+
+        if isinstance(window, kaa.display.X11Window):
+            # Create a new inner window.  We must do this each time we start
+            # MPlayer because MPlayer destroys the window (even the ones it
+            # doesn't manage [!!]) at exit.
+            inner = self._proxy._window_inner = kaa.display.X11Window(size=(1,1), parent=window)
+            inner.show()
+            # Set owner to False so we don't try to destroy the window.
+            inner.owner = False
+            args.add(wid=hex(inner.id).rstrip('L'))
+            window.resize(self.width, self.height)
+
+        if isinstance(window, PlayerIndependentWindow):
+            if window.fullscreen:
+                args.append('-fs')
+        if vf:
+            args.add(vf=','.join(vf))
+
+        # MPlayer has issues with interlaced h264 inside transport streams that
+        # can be fixed with -nocorrect-pts (and -demuxer lavf, which we're
+        # already forcing).  Unfortunately, kaa.metadata doesn't support these
+        # files yet, nor can we tell if the content is interlaced.  So we guess
+        # based on file extension.  Luckily -nocorrect-pts doesn't seem to hurt
+        # progressive content.
+        ext = os.path.splitext(self.uri)[1].lower()
+        if self.vfourcc == 'H264' and ext in ('.ts', '.m2ts'):
+            args.append('-nocorrect-pts')
 
         # There is no way to make MPlayer ignore keys from the X11 window.  So
         # this hack makes a temp input file that maps all keys to a dummy (and
         # non-existent) command which causes MPlayer not to react to any key
-        # presses, allowing us to implement our own handlers.  The temp file is
-        # deleted once MPlayer has read it.
+        # presses, allowing us to implement our own handlers.
         tempfile = kaa.tempfile('popcorn/mplayer-input.conf')
         if not os.path.isfile(tempfile):
             keys = filter(lambda x: x not in string.whitespace, string.printable)
-            keys = list(keys) + self._mp_info["keylist"]
+            keys = list(keys) + self._mp_info['keylist']
             fd = open(tempfile, 'w')
             for key in keys:
                 fd.write("%s noop\n" % key)
             fd.close()
-        # only prevent input if the player is embedded
-        if config.mplayer.embedded:
-            args.add(input='conf=%s' % tempfile)
+        args.add(input='conf=%s' % tempfile)
 
-        # set properties subtitle filename and subtitle track
-        if self._properties.get('subtitle-filename'):
-            sub = self._properties.get('subtitle-filename')
-            if os.path.splitext(sub)[1].lower() in ('.ifo', '.idx', '.sub'):
-                args.add(vobsub=os.path.splitext(sub)[0],
-                         vobsubid=self._properties.get('subtitle-track'))
-            else:
-                args.add(subfile=sub)
-        elif self._properties.get('subtitle-track') != None:
-            args.add(sid=self._properties.get('subtitle-track'))
+        log.debug('Starting MPlayer with args: %s', ' '.join(args))
+        self.state = STATE_STARTING
+        self._spawn(args, interactive=True)
 
-        if self._properties.get('cache') == 'auto':
-            if self._media.scheme == "dvd":
-                args.add(cache=8192)
-            if self._media.scheme == "vcd":
-                args.add(cache=4096)
-            if self._media.scheme == "dvb":
-                args.add(cache=1024)
-            if self._media.scheme == "http":
-                args.add(cache=8192, cache_min=5)
-            else:
-                args.add(cache=5000)
-        else:
-            args.add(cache=self._properties.get('cache'))
+        yield self._wait_for_signals('play', task='Play')
 
-        # connect to signals
-        self._mplayer.signals['readline'].connect_weak(self._child_handle_line)
-
-        # start playback
-        self._mplayer.start(self._media).connect_weak(self._child_exited)
+        # Play has begun successfully.  _handle_child_line() will already
+        # have set state to STATE_PLAYING.
+        if isinstance(window, kaa.display.X11Window):
+            # XXX: is it reasonable to automatically show the window now?
+            # Maybe we should have an autoshow property?
+            window.show()
 
 
+    @kaa.coroutine(policy=kaa.POLICY_SINGLETON)
     def stop(self):
-        """
-        Stop playback.
-        """
-        if self._mplayer:
-            self._mplayer.stop()
-            self.state = STATE_SHUTDOWN
+        log.info('Stopping mplayer, state=%s', self.state)
+        if self.state == STATE_NOT_RUNNING:
+            # Nothing to do.  Don't need to test that state is STATE_STOPPING,
+            # because POLICY_SINGLETON makes sure we don't reenter until stopped.
+            yield True
+
+        log.info('Stopping mplayer (running: %s)', 'yes' if self._child else 'no')
+        orig_state = self.state
+        self.state = STATE_STOPPING
+        if self._child:
+            # Tell child to quit; this will issue quit slave command twice in
+            # case mplayer is paused.
+            yield self._child.stop()
+            # Once we get here, self._child is None.
+
+        # Child is dead, adjust state.
+        self.state = STATE_NOT_RUNNING
+        self._reset_stream()
+        if orig_state in (STATE_STARTING, STATE_PLAYING, STATE_PAUSED):
+            self._proxy.signals['stop'].emit()
 
 
+    @precondition(states=STATE_PLAYING)
+    @kaa.coroutine(policy=kaa.POLICY_SINGLETON)
     def pause(self):
-        """
-        Pause playback.
-        """
-        self._mplayer.pause()
+        self._slave_cmd('pause')
+        yield self._wait_for_signals('pause', task='Pause')
+ 
 
-
+    @precondition(states=STATE_PAUSED)
+    @kaa.coroutine(policy=kaa.POLICY_SINGLETON)
     def resume(self):
-        """
-        Resume playback.
-        """
-        self._mplayer.pause()
+        self._slave_cmd('pause')
+        yield self._wait_for_signals('play', task='Resume')
 
 
-    def seek(self, value, type):
-        """
-        SEEK_RELATIVE, SEEK_ABSOLUTE and SEEK_PERCENTAGE.
-        """
+    @precondition(states=(STATE_OPEN, STATE_PLAYING, STATE_PAUSED))
+    @kaa.coroutine(policy=kaa.POLICY_PASS_LAST)
+    def seek(self, value, type, last=None):
+        if self._state == STATE_OPEN:
+            # FIXME: it's possible to seek between launching MPlayer but before
+            # STATE_PLAYING.  The seek will get lost here.
+            if type == SEEK_PERCENTAGE:
+                # Translate to absolute position.
+                value = self._stream_info['length'] * value / 100
+            self._ss_seek = value
+            yield None
+            
         s = [SEEK_RELATIVE, SEEK_PERCENTAGE, SEEK_ABSOLUTE]
-        self._mplayer.seek(value, s.index(type))
+        self._waiting_for_seek += 1
+        self._slave_cmd('seek', value, s.index(type))
+        if last:
+            # seek has already been called.  wait for the last week
+            # to complete before we terminate this coroutine.
+            yield last
+        # Now the next seek event from mplayer is ours.  Wait for that one. 
+        yield self._wait_for_signals('seek', task='Seek')
+        # Done seeking.  Return current position to caller.
+        self._waiting_for_seek -= 1
+        yield self.position
 
 
-    #
-    # Property settings
-    #
-
-    @runtime_policy(DEFER_UNTIL_PLAYING)
-    def _set_prop_audio_delay(self, delay):
+    def reset(self):
         """
-        Sets audio delay. Positive value defers audio by delay.
+        Proxy is going to reuse us for a new file.  Reset all stream parameters.
         """
-        self._mplayer.audio_delay(-delay, 1)
+        # Proxy ensures reset() does not get called until stop() is finished.  If
+        # we're stopped, stream is already reset.  So reset() is a no-op for this
+        # backend.
+        print "Mplayer: reset"
 
 
-    @runtime_policy(IGNORE_UNLESS_PLAYING)
-    def _set_prop_audio_track(self, id):
+    def release(self):
         """
-        Change audio track (mpeg and mkv only)
+        Proxy is going to use a different backend for a new file.  Must release
+        all resources so the new backend can grab them.
         """
-        self._mplayer.switch_audio(id)
-
-
-    @runtime_policy(IGNORE_UNLESS_PLAYING)
-    def _set_prop_subtitle_track(self, id):
-        """
-        Change subtitle track
-        """
-        self._mplayer.sub_select(id)
-
-
-    @runtime_policy(IGNORE_UNLESS_PLAYING)
-    def _set_prop_subtitle_filename(self, filename):
-        """
-        Change subtitle filename
-        """
-        self._mplayer.sub_load(filename)
-
-
-    @runtime_policy(DEFER_UNTIL_PLAYING)
-    def _set_prop_subtitle_visibility(self, enabled):
-        """
-        Change subtitle visibility
-        """
-        self._mplayer.sub_visibility(int(enabled))
-
-    #
-    # Methods for filter handling (not yet in generic and base)
-    #
-    # FIXME: no distinction between audio and video filters
-
-    def prepend_filter(self, filter):
-        """
-        Add filter to the prepend list.
-        """
-        self._filters_pre.append(filter)
-
-
-    def append_filter(self, filter):
-        """
-        Add filter to the normal filter list.
-        """
-        self._filters_add.append(filter)
-
-
-    def get_filters(self):
-        """
-        Return all filter set.
-        """
-        return self._filters_pre + self._filters_add
-
-
-    def remove_filter(self, filter):
-        """
-        Remove filter for filter list.
-        """
-        for l in (self._filters_pre, self._filters_add):
-            if filter in l:
-                l.remove(filter)
-
-
-    #
-    # Methods and helper for MediaPlayer subclasses for CAP_OSD
-    #
-
-    def osd_can_update(self):
-        """
-        Returns True if it is safe to write to the player's shared memory
-        buffer used for OSD, and False otherwise.  If this buffer is written
-        to even though this function returns False, the OSD may exhibit
-        corrupt output or tearing during animations.
-        See generic.osd_can_update for details.
-        """
-        if not self._osd_shmem:
-            return False
-
-        try:
-            if ord(self._osd_shmem.read(1)) == BUFFER_UNLOCKED:
-                return True
-        except shm.error:
-            self._osd_shmem.detach()
-            self._osd_shmem = None
-
-        return False
-
-
-
-    def osd_update(self, alpha = None, visible = None, invalid_regions = None):
-        """
-        Updates the OSD of the player based on the given argments:
-        See generic.osd_update for details.
-        """
-        cmd = []
-        if alpha != None:
-            cmd.append("alpha=%d" % alpha)
-        if visible != None:
-            cmd.append("visible=%d" % int(visible))
-        if invalid_regions:
-            for (x, y, w, h) in invalid_regions:
-                cmd.append("invalidate=%d:%d:%d:%d" % (x, y, w, h))
-        self._mplayer.overlay(','.join(cmd))
-        self._overlay_set_lock(BUFFER_LOCKED)
-
-
-    def _overlay_set_lock(self, byte):
-        try:
-            if self._osd_shmem and self._osd_shmem.attached:
-                self._osd_shmem.write(chr(byte))
-        except shm.error:
-            self._osd_shmem.detach()
-            self._osd_shmem = None
-
-
-
-    #
-    # Methods and helper for MediaPlayer subclasses for CAP_CANVAS
-    #
-
-
-    def set_frame_output_mode(self, vo = None, notify = None, size = None):
-        """
-        Controls if and how frames are delivered via the 'frame' signal, and
-        whether or not frames are drawn to the vo driver's video window.
-        See generic.set_frame_output_mode for details.
-        """
-        if vo != None:
-            self._cur_outbuf_mode[0] = vo
-        if notify != None:
-            self._cur_outbuf_mode[1] = notify
-            if notify:
-                self._check_new_frame_t.start(0.01)
-            else:
-                self._check_new_frame_t.stop()
-        if size != None:
-            self._cur_outbuf_mode[2] = size
-
-        if not self._is_alive():
-            return
-
-        mode = { (False, False): 0, (True, False): 1,
-                 (False, True): 2, (True, True): 3 }
-        mode = mode[tuple(self._cur_outbuf_mode[:2])]
-
-        size = self._cur_outbuf_mode[2]
-        if size == None:
-            self._mplayer.outbuf(mode)
-        else:
-            self._mplayer.outbuf(mode, size[0], size[1])
-
-
-    def unlock_frame_buffer(self):
-        """
-        Unlocks the frame buffer provided by the last 'frame' signal
-        See generic.unlock_frame_buffer for details.
-        """
-        try:
-            self._frame_shmem.write(chr(BUFFER_UNLOCKED))
-        except shm.error:
-            self._frame_shmem.detach()
-            self._frame_shmem = None
-
-
-    def _check_new_frame(self):
-        if not self._frame_shmem:
-            return
-
-        try:
-            lock, width, height, aspect = \
-                  struct.unpack("hhhd", self._frame_shmem.read(16))
-        except shm.error:
-            self._frame_shmem.detach()
-            self._frame_shmem = None
-            return
-
-        if lock & BUFFER_UNLOCKED:
-            return
-
-        if width > 0 and height > 0 and aspect > 0:
-            self.signals["frame"].emit(\
-                width, height, aspect, self._frame_shmem.addr + 16, "yv12")
+        # Proxy ensures release() does not get called until stop() is finished.  If
+        # we're stopped, MPlayer is exited and therefore obviously is not holding
+        # any resources.  So release() is a no-op for this backend.
+        print 'mplayer: release'
+        return kaa.NotFinished
