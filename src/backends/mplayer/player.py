@@ -288,7 +288,7 @@ class MPlayer(object):
             self._proxy.signals['position-changed'].emit(old, self._position)
 
 
-        elif line.startswith('ID_PAUSED'):
+        elif line.startswith('ID_PAUSED') or line.find('==  PAUSE  ==') >= 0:
             self.state = STATE_PAUSED
             self._proxy.signals['pause'].emit()
 
