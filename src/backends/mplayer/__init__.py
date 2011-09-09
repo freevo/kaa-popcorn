@@ -39,6 +39,8 @@ def get_capabilities():
     from config import config
     from utils import get_mplayer_info
 
+    if not config.enabled:
+        return None, None, None, None, None
 
     capabilities = {
         CAP_VIDEO: True,
