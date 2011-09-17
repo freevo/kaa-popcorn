@@ -36,7 +36,18 @@ import string
 import kaa
 import kaa.utils
 from kaa.utils import property
-import kaa.display
+
+try:
+    from kaa.display import X11Window
+except ImportError:
+    class X11Window(object):
+        pass
+
+try:
+    from kaa.candy import Stage as CandyStage
+except ImportError:
+    class CandyStage(object):
+        pass
 
 # kaa.popcorn imports
 from ...common import *
@@ -121,7 +132,7 @@ class MPlayer(object):
                 # it to none now so the proxy doesn't try to do anything with it,
                 # and so that we recreate it on the next play().
                 self._proxy._window_inner = None
-                if isinstance(self._proxy.window, kaa.display.X11Window):
+                if isinstance(self._proxy.window, X11Window):
                     # Hide the window.  Again, should we do this automatically or 
                     # use a property?  XXX: note if we don't do it automatically,
                     # we will need to explicitly call proxy._window_layot() after
@@ -470,17 +481,24 @@ class MPlayer(object):
             args.add(vo='xv,x11')
             vf.append(getattr(config.mplayer.deinterlacer, config.video.deinterlacing.method))
 
-        if isinstance(window, kaa.display.X11Window):
+        if isinstance(window, X11Window):
             # Create a new inner window.  We must do this each time we start
             # MPlayer because MPlayer destroys the window (even the ones it
             # doesn't manage [!!]) at exit.
-            inner = self._proxy._window_inner = kaa.display.X11Window(size=(1,1), parent=window)
+            inner = self._proxy._window_inner = X11Window(size=(1,1), parent=window)
+            inner.signals['key_press_event'].connect_weak(window.signals['key_press_event'].emit)
             inner.show()
             # Set owner to False so we don't try to destroy the window.
             inner.owner = False
             args.add(wid=hex(inner.id).rstrip('L'))
             window.resize(self.width, self.height)
-
+        if isinstance(window, CandyStage):
+            args.add(wid=hex(window.wid).rstrip('L'))
+            # The window cannot be resized with a different aspect
+            # ratio anymore. But a kaa.candy stage is not designed to
+            # do so. In the future we may be able to create a real
+            # subwindow for mplayer.
+            vf.append('expand=:::::%s/%s' % (window.width, window.height))
         if vf:
             args.add(vf=','.join(vf))
 
@@ -504,15 +522,15 @@ class MPlayer(object):
         # this hack makes a temp input file that maps all keys to a dummy (and
         # non-existent) command which causes MPlayer not to react to any key
         # presses, allowing us to implement our own handlers.
-        tempfile = kaa.tempfile('popcorn/mplayer-input.conf')
-        if not os.path.isfile(tempfile):
-            keys = filter(lambda x: x not in string.whitespace, string.printable)
-            keys = list(keys) + self._mp_info['keylist']
-            fd = open(tempfile, 'w')
-            for key in keys:
-                fd.write("%s noop\n" % key)
-            fd.close()
-        args.add(input='conf=%s' % tempfile)
+        # tempfile = kaa.tempfile('popcorn/mplayer-input.conf')
+        # if not os.path.isfile(tempfile):
+        #     keys = filter(lambda x: x not in string.whitespace, string.printable)
+        #     keys = list(keys) + self._mp_info['keylist']
+        #     fd = open(tempfile, 'w')
+        #     for key in keys:
+        #         fd.write("%s noop\n" % key)
+        #     fd.close()
+        # args.add(input='conf=%s' % tempfile)
 
         log.debug('Starting MPlayer with args: %s', ' '.join(args))
         self.state = STATE_STARTING
@@ -522,7 +540,7 @@ class MPlayer(object):
 
         # Play has begun successfully.  _handle_child_line() will already
         # have set state to STATE_PLAYING.
-        if isinstance(window, kaa.display.X11Window):
+        if isinstance(window, X11Window):
             # XXX: is it reasonable to automatically show the window now?
             # Maybe we should have an autoshow property?
             window.show()

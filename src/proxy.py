@@ -247,6 +247,14 @@ class Player(kaa.Object):
             feature title).
 
             This signal will also emit when the stream begins.
+            ''',
+
+        'key-pressed':
+            '''
+            Emitted when a key is pressed in the player window
+            (kaa.display.XWindow only).
+
+            .. describe:: def callback(...)
             '''
     }
 
@@ -302,17 +310,19 @@ class Player(kaa.Object):
     def window(self, window):
         if window is None:
             # User wants to disable video output.
-            if self._window:
+            if self._window and isinstance(self._window, kaa.display.X11Window):
                 # Clean up the existing window.
                 self._window.signals['expose_event'].disconnect(self._window_handle_expose)
                 self._window.signals['resize_event'].disconnect(self._window_handle_resize)
                 self._window.signals['delete_event'].disconnect(self._window_handle_delete)
+                self._window.signals['key_press_event'].disconnect(self._window_handle_key)
             self._window = False
         elif window != self._window and isinstance(window, kaa.display.X11Window):
             self._window = window
             window.signals['expose_event'].connect_weak(self._window_handle_expose)
             window.signals['resize_event'].connect_weak(self._window_handle_resize)
             window.signals['delete_event'].connect_weak(self._window_handle_delete)
+            window.signals['key_press_event'].connect_weak(self._window_handle_key)
             # The inner child window is where the video actually displays, and
             # it must be created and managed by the backend.  'window' is the
             # outer window which will contain any black bars we draw to
@@ -469,6 +479,8 @@ class Player(kaa.Object):
         self._window.hide()
         self.stop()
 
+    def _window_handle_key(self, key):
+        self.signals['key-pressed'].emit(key)
 
     def _emit_finished(self, exc):
         self.signals['finished'].emit(exc)
