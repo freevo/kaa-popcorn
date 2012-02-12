@@ -1,5 +1,5 @@
 # -*- coding: iso-8859-1 -*-
-# $Id$
+# $Id: player.py 4543 2011-09-17 19:11:07Z dmeyer $
 # -----------------------------------------------------------------------------
 # player.py - mplayer backend
 # -----------------------------------------------------------------------------
@@ -61,7 +61,7 @@ log = logging.getLogger('popcorn.mplayer')
 RE_STATUS = re.compile(r'(?:V:\s*([\d.]+)|A:\s*([\d.]+)\s\W)(?:.*\s([\d.]+x))?')
 RE_ERROR = re.compile(r'^(File not found|Failed to open|MPlayer interrupt|Unknown option|Error parsing|FATAL:)')
 
-STREAM_INFO_MAP = { 
+STREAM_INFO_MAP = {
     'VIDEO_FORMAT': ('vfourcc', str),
     'VIDEO_CODEC': ('vcodec', str),
     'VIDEO_BITRATE': ('vbitrate', int),
@@ -133,7 +133,7 @@ class MPlayer(object):
                 # and so that we recreate it on the next play().
                 self._proxy._window_inner = None
                 if isinstance(self._proxy.window, X11Window):
-                    # Hide the window.  Again, should we do this automatically or 
+                    # Hide the window.  Again, should we do this automatically or
                     # use a property?  XXX: note if we don't do it automatically,
                     # we will need to explicitly call proxy._window_layot() after
                     # playing because there will be no resize event to do that
@@ -141,7 +141,7 @@ class MPlayer(object):
                     self._proxy.window.hide()
 
             self._state = value
-                
+
 
     @property
     def position(self):
@@ -216,12 +216,14 @@ class MPlayer(object):
         self._stream_info['deinterlace'] = bool(value)
         if self._child:
             self._slave_cmd('set_property deinterlace %d' % int(value))
-        
+
 
     #########################################
     # Private Methods
 
     def _handle_child_exit(self, code):
+        log.info('handle_child_exit %s', code)
+        self._child.signals['finished'].disconnect(self._handle_child_exit)
         self._child = None
         if self.state in (STATE_STARTING, STATE_PLAYING, STATE_PAUSED):
             # Child died when we didn't expect it to.  Adjust state now and
@@ -232,19 +234,10 @@ class MPlayer(object):
             self._proxy._emit_finished(exc)
             self._proxy.signals['error'].emit(exc, self.state, STATE_NOT_RUNNING)
         else:
+            self._proxy._emit_finished(None)
             log.info('MPlayer child exited: state=%s', self.state)
         self.state = STATE_NOT_RUNNING
 
-
-    def _spawn(self, args, interactive=False):
-        self._child = kaa.Process(self._mp_cmd)
-        self._child.delimiter = ['\r', '\n']
-        if interactive:
-            self._child.stop_command = 'quit\nquit\n'
-
-        self._child.signals['finished'].connect_weak(self._handle_child_exit)
-        self._child.signals['readline'].connect_weak(self._handle_child_line)
-        return self._child.start([ str(x) for x in args ])
 
     def _slave_cmd(self, cmd, *args):
         output = 'pausing_keep %s %s' % (cmd, ' '.join([ str(x) for x in args]))
@@ -262,7 +255,7 @@ class MPlayer(object):
 
             old = self._position
             self._position = float((m.group(1) or m.group(2)).replace(',', '.'))
-            
+
             if self._stream_changed and self.state != STATE_STARTING:
                 # Stream changed so emit.  We don't bother emitting if the
                 # stream state is STATE_STARTING since we handle that later.
@@ -311,8 +304,7 @@ class MPlayer(object):
                 self._stream_changed = True
 
         elif line.startswith('EOF code'):
-            self.state = STATE_NOT_RUNNING
-            self._proxy._emit_finished(None)
+            self.state = STATE_STOPPING
 
         elif re.match(RE_ERROR, line):
             self._error_message = line
@@ -394,7 +386,7 @@ class MPlayer(object):
         :param media: the object representing the file to load.
         :type media: :class:`kaa.metadata.Media`
         :returns: :class:`~kaa.InProgress`
-        
+
         Required state is STATE_NOT_RUNNING, which we expect the proxy to
         enforce.  State is immediately changed to STATE_OPENING.  The returned
         InProgress is finished and state set to STATE_OPEN upon successful open
@@ -427,10 +419,11 @@ class MPlayer(object):
         # before calling play. MPlayer doesn't work that way so we have to run
         # mplayer with -identify first.
         args.extend('-vo null -ao null -frames 0 -nocache -demuxer lavf')
-        self._spawn(args)
 
-        yield self._wait_for_signals(task='Open')
-
+        self._child = kaa.Process(self._mp_cmd)
+        self._child.delimiter = ['\r', '\n']
+        self._child.signals['readline'].connect_weak(self._handle_child_line)
+        yield self._child.start([ str(x) for x in args ])
         # If we're here, identify was successful, so we're open for business.
         self.state = STATE_OPEN
         self._proxy.signals['open'].emit()
@@ -442,7 +435,7 @@ class MPlayer(object):
         config = self._proxy._config
         vf = []
         args = self._media._mplayer_args[:]
-        args.extend('-slave -v -osdlevel 0 -fixed-vo -demuxer lavf')
+        args.extend('-slave -v -osdlevel 0 -noautosub -nosub')
 
         if self.audio_delay:
             args.add(delay=self.audio_delay)
@@ -465,8 +458,11 @@ class MPlayer(object):
         if window is None:
             args.add(vo='null')
         elif config.video.vdpau.enabled and 'vdpau' in self._mp_info['video_drivers']:
-            deint = {'cheap': 1, 'good': 2, 'better': 3, 'best': 4}.get(config.video.deinterlacing.method, 3)
-            args.add(vo='vdpau:deint=%d,xv,x11' % deint)
+            if config.video.deinterlacing.enabled in ('auto', 'yes'):
+                deint = {'cheap': 1, 'good': 2, 'better': 3, 'best': 4}.get(config.video.deinterlacing.method, 3)
+                args.add(vo='vdpau:deint=%d,xv,x11' % deint)
+            else:
+                args.add(vo='vdpau,xv,x11')
 
             # Decide which codecs to enable based on what the user specified.  We do
             # a simple substring match.
@@ -475,7 +471,7 @@ class MPlayer(object):
 
             # If the display rate is less than the frame rate, -framedrop is
             # needed or else the audio will continually drift.
-            # TODO: we could decide to add this only if the above condition is 
+            # TODO: we could decide to add this only if the above condition is
             args.append('-framedrop')
         else:
             args.add(vo='xv,x11')
@@ -518,7 +514,7 @@ class MPlayer(object):
         # XXX other options and what device to use are ignored.
         if config.audio.passthrough:
             args.add(ac='hwac3,hwdts,')
-        
+
         # There is no way to make MPlayer ignore keys from the X11 window.  So
         # this hack makes a temp input file that maps all keys to a dummy (and
         # non-existent) command which causes MPlayer not to react to any key
@@ -535,10 +531,13 @@ class MPlayer(object):
 
         log.debug('Starting MPlayer with args: %s', ' '.join(args))
         self.state = STATE_STARTING
-        self._spawn(args, interactive=True)
-
+        self._child = kaa.Process(self._mp_cmd)
+        self._child.delimiter = ['\r', '\n']
+        self._child.stop_command = 'quit\nquit\n'
+        self._child.signals['readline'].connect_weak(self._handle_child_line)
+        self._child.signals['finished'].connect_weak(self._handle_child_exit)
+        self._child.start([ str(x) for x in args ])
         yield self._wait_for_signals('play', task='Play')
-
         # Play has begun successfully.  _handle_child_line() will already
         # have set state to STATE_PLAYING.
         if isinstance(window, X11Window):
@@ -576,7 +575,7 @@ class MPlayer(object):
     def pause(self):
         self._slave_cmd('pause')
         yield self._wait_for_signals('pause', task='Pause')
- 
+
 
     @precondition(states=STATE_PAUSED)
     @kaa.coroutine(policy=kaa.POLICY_SINGLETON)
@@ -596,7 +595,7 @@ class MPlayer(object):
                 value = self._stream_info['length'] * value / 100
             self._ss_seek = value
             yield None
-            
+
         s = [SEEK_RELATIVE, SEEK_PERCENTAGE, SEEK_ABSOLUTE]
         self._waiting_for_seek += 1
         self._slave_cmd('seek', value, s.index(type))
@@ -604,7 +603,7 @@ class MPlayer(object):
             # seek has already been called.  wait for the last week
             # to complete before we terminate this coroutine.
             yield last
-        # Now the next seek event from mplayer is ours.  Wait for that one. 
+        # Now the next seek event from mplayer is ours.  Wait for that one.
         yield self._wait_for_signals('seek', task='Seek')
         # Done seeking.  Return current position to caller.
         self._waiting_for_seek -= 1
