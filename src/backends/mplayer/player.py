@@ -486,6 +486,7 @@ class MPlayer(object):
             # MPlayer because MPlayer destroys the window (even the ones it
             # doesn't manage [!!]) at exit.
             inner = self._proxy._window_inner = X11Window(size=(1,1), parent=window)
+            inner.set_cursor_visible(False)
             inner.signals['key_press_event'].connect_weak(window.signals['key_press_event'].emit)
             inner.show()
             # Set owner to False so we don't try to destroy the window.
